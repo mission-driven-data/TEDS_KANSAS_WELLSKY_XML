@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wellsky-teds"
+version = "0.1.0"
+description = "Build and check WellSky Custom TEDS Import XML for Kansas (KDADS), and predict the errors WellSky will return."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Mission Driven Data" }]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-cov"]
+
+[project.scripts]
+wellsky-teds = "WellSkyTEDS:main"
+
+[tool.setuptools]
+py-modules = ["WellSkyTEDS"]
