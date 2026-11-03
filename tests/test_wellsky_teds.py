@@ -196,6 +196,149 @@ def test_episode_without_license_is_left_out():
 
 
 # ----------------------------------------------------------------------
+# Adding the same thing twice
+# ----------------------------------------------------------------------
+def quiet():
+    """A monitor that keeps its lines and prints nothing."""
+    return ConsoleMonitor(verbose=False)
+
+
+def logged(monitor, category, severity):
+    """How many lines the monitor holds for one method and severity."""
+    return sum(1 for line in monitor.lines if(f"| {category} | {severity} |" in line))
+
+
+def test_the_same_client_added_twice_is_held_once_with_its_episodes_merged():
+    teds = make_teds()
+    first = add_full_record(teds)
+    again = add_full_record(teds)
+    later = teds.add_record(client_values(), [dict(episode_values(admit_date="06012024"), substances=[substance_values()[0]])])
+    assert first is again is later
+    assert len(teds.clients) == 1
+    assert [e.values["DateOfAdmission"] for e in first.episodes] == ["04082024", "06012024"]
+    assert all(e.client is first for e in first.episodes)
+    assert teds.predict_errors() == []
+    root = ET.fromstring(teds.build_files()["KDADS_00987654_202609140815.xml"].encode())
+    assert len(root.findall("Client")) == 1 and len(root.find("Client").findall("Admission")) == 2
+    # Two Add Client lines, and one Add Episode line for the episode the second add repeated.
+    assert logged(teds.monitor, "Add Client", "Info") == 2 and logged(teds.monitor, "Add Episode", "Info") == 1
+    assert not any("| Warning |" in line for line in teds.monitor.lines)
+    # The same object added again is simply returned.
+    assert teds.add_client(first) is first and len(teds.clients) == 1
+    with pytest.raises(AttributeError):
+        teds.clients.append(Client(**client_values(source_id="90000002")))
+
+
+def test_a_client_with_the_same_id_and_different_values_is_left_out_and_reported():
+    teds = make_teds()
+    first = add_full_record(teds)
+    kept = add_full_record(teds, client=client_values(first_name="Other"), episode=episode_values(admit_date="06012024"))
+    assert kept is first and len(teds.clients) == 1
+    assert first.values["FirstName"] == "Robin" and len(first.episodes) == 1
+    found = warnings(teds.predict_errors(), "Client")
+    assert [(i["record_type"], i["client_source_id"], i["value"]) for i in found] == [("Client", "80000001", "")]
+    assert "different values" in found[0]["message"] and "Other" not in found[0]["message"]
+    assert logged(teds.monitor, "Add Client", "Warning") == 1
+
+
+def test_a_blank_client_id_never_matches():
+    teds = make_teds()
+    add_full_record(teds, client=client_values(source_id=""))
+    add_full_record(teds, client=client_values(source_id=""))
+    assert len(teds.clients) == 2
+
+
+def test_the_same_episode_added_twice_is_held_once():
+    monitor = quiet()
+    client = Client(**client_values(), monitor=monitor)
+    episode = client.add_episode(Episode(**episode_values()))
+    episode.add_substance(Substance(**substance_values()[0]))
+    episode.set_discharge(**discharge_values())
+    # Built again in full: equal, so the held one comes back.
+    copy = Episode(**episode_values())
+    copy.add_substance(Substance(**substance_values()[0]))
+    copy.set_discharge(**discharge_values())
+    assert copy == episode and copy is not episode
+    assert client.add_episode(copy) is episode
+    # Built again before its substances, as a loop over admissions does: the held one comes back, so chained calls go to it.
+    again = client.add_episode(Episode(**episode_values()))
+    assert again is episode
+    assert again.add_substance(Substance(**substance_values()[0])) is episode.substances[0]
+    assert len(client.episodes) == 1 and len(episode.substances) == 1
+    # Another program on the same day is a different episode.
+    other = client.add_episode(Episode(**episode_values(license="00923456")))
+    assert other is not episode and len(client.episodes) == 2
+    assert not warnings(client.predict_errors())
+    assert logged(monitor, "Add Episode", "Info") == 2 and logged(monitor, "Add Substance", "Info") == 1
+
+
+def test_an_episode_with_the_same_key_and_different_values_is_left_out_and_reported():
+    teds = make_teds()
+    client = add_full_record(teds)
+    left_out = Episode(**episode_values(treatment_setting="06"))
+    assert client.add_episode(left_out) is client.episodes[0]
+    assert len(client.episodes) == 1 and left_out.client is None
+    found = warnings(teds.predict_errors(), "Episode")
+    assert [(i["record_type"], i["license"], i["client_source_id"], i["value"]) for i in found] == [("Episode", "00987654", "80000001", "04082024")]
+    assert logged(teds.monitor, "Add Episode", "Warning") == 1
+
+
+def test_the_same_rank_twice_with_equal_values_is_held_once():
+    monitor = quiet()
+    episode = Episode(**episode_values(), monitor=monitor)
+    first = episode.add_substance(Substance(**substance_values()[0]))
+    assert episode.add_substance(Substance(**substance_values()[0])) is first
+    assert episode.add_substance(Substance(**dict(substance_values()[0], rank="Primary"))) is first
+    assert len(episode.substances) == 1
+    client = Client(**client_values())
+    client.add_episode(episode)
+    assert episode.predict_errors() == []
+    assert logged(monitor, "Add Substance", "Info") == 2
+
+
+def test_the_same_rank_twice_with_different_values_keeps_the_first_and_reports_it():
+    monitor = quiet()
+    episode = Episode(**episode_values(), monitor=monitor)
+    first = episode.add_substance(Substance(**substance_values()[0]))
+    other = dict(substance_values()[0], substance="05", detailed_drug_code="0501")
+    assert episode.add_substance(Substance(**other)) is first
+    assert [s.values["Substance"] for s in episode.substances] == ["02"]
+    Client(**client_values()).add_episode(episode)
+    issues = episode.predict_errors()
+    assert not errors(issues)
+    assert [(i["element"], i["value"], i["error"]) for i in warnings(issues)] == [("Substance", "P", "Data integrity")]
+    assert logged(monitor, "Add Substance", "Warning") == 1
+
+
+def test_in_checks_on_all_three_classes():
+    teds = make_teds()
+    client = add_full_record(teds)
+    episode = client.episodes[0]
+    assert Client(**client_values()) in teds
+    assert Client(**client_values(first_name="Other")) not in teds
+    assert Client(**client_values(source_id="90000002")) not in teds
+    copy = Episode(**episode_values())
+    for values in substance_values():
+        copy.add_substance(Substance(**values))
+    copy.set_discharge(**discharge_values())
+    assert copy in client
+    assert Episode(**episode_values()) not in client
+    assert Substance(**substance_values()[1]) in episode
+    assert Substance(**dict(substance_values()[1], route="03")) not in episode
+    assert Substance(rank="T", substance="02") not in episode
+    # Equal objects are ==, and still hash by identity, so they work in sets as before.
+    assert Substance(**substance_values()[0]) == Substance(**substance_values()[0])
+    assert len({episode, copy}) == 2 and Client(**client_values()) != "80000001"
+
+
+def test_reading_a_file_keeps_two_episodes_on_one_day():
+    client = Client(**client_values())
+    first = client.read_episode(Episode(**episode_values(treatment_setting="07")))
+    second = client.read_episode(Episode(**episode_values(treatment_setting="06")))
+    assert client.episodes == (first, second) and second.client is client
+
+
+# ----------------------------------------------------------------------
 # Predicting
 # ----------------------------------------------------------------------
 def test_required_and_code_checks():
@@ -295,23 +438,31 @@ def test_substance_codes_and_discharge_pairs():
 def test_duplicate_substances():
     teds = make_teds()
     same = dict(substance="02", detailed_drug_code="0201", route="01", frequency="05", age_first_use="15", discharge_substance="02", discharge_frequency="01")
-    unknown = dict(substance="97", detailed_drug_code="9997", route="97", frequency="97", age_first_use="97")
+    unknown = dict(substance="97", detailed_drug_code="9997", route="97", frequency="97", age_first_use="97", discharge_substance="97")
     add_full_record(teds, substances=[dict(rank="P", **same), dict(rank="S", **same), dict(rank="T", **unknown)])
+    # 97 (Unknown) in two slots, at admission and at discharge, is not reported at all.
     add_full_record(teds, client=client_values(source_id="90000002"), substances=[dict(rank="P", **same), dict(rank="S", **unknown), dict(rank="T", **unknown)])
     issues = teds.predict_errors()
     duplicate = "Duplicate Substance Codes not allowed unless Detailed Drug Codes are different"
-    assert [i["client_source_id"] for i in errors(issues) if(i["error"] == duplicate)] == ["80000001"]
-    found = {(i["client_source_id"], i["element"], i["record_type"]) for i in warnings(issues) if(i["error"] == duplicate)}
-    assert ("80000001", "SecondarySubstance", "Discharge") in found and ("90000002", "TertiarySubstance", "Admission") in found
+    found = [(i["client_source_id"], i["element"], i["record_type"], i["severity"]) for i in issues if(i["error"] == duplicate)]
+    assert sorted(found) == [("80000001", "SecondarySubstance", "Admission", "Error"), ("80000001", "SecondarySubstance", "Discharge", "Warning")]
 
 
 def test_bad_rank_and_repeated_rank():
     teds = make_teds()
+    # A second P with different values (no discharge values) is left out as it is added; the bad rank Q is still added.
     substances = substance_values() + [dict(rank="Q", substance="02"), dict(rank="Primary", substance="02", detailed_drug_code="0201", route="01", frequency="05", age_first_use="15")]
-    add_full_record(teds, substances=substances)
-    messages = [i["message"] for i in errors(teds.predict_errors(), "Substance")]
-    assert any("Rank 'Q'" in m for m in messages) and any("ranked P" in m for m in messages)
+    episode = add_full_record(teds, substances=substances).episodes[0]
+    assert [s.rank for s in episode.substances] == ["P", "S", "Q"]
+    assert episode.substances[0].discharge_values["Substance"] == "02"
+    issues = teds.predict_errors()
+    messages = [i["message"] for i in errors(issues, "Substance")]
+    assert any("Rank 'Q'" in m for m in messages) and not any("ranked P" in m for m in messages)
+    assert [(i["value"], i["record_type"]) for i in warnings(issues, "Substance")] == [("P", "Admission")]
     assert not Substance(rank="Q").validate() and Substance(**substance_values()[0]).validate()
+    # A rank changed after it was added can still repeat, and the old check still reports it.
+    episode.substances[1].rank = "P"
+    assert any("ranked P" in i["message"] for i in errors(episode.predict_errors(), "Substance"))
 
 
 def test_date_checks():
@@ -370,16 +521,17 @@ def test_unattached_episode_and_lonely_client():
 
 def test_file_level_checks():
     teds = make_teds()
-    add_full_record(teds)
-    add_full_record(teds)
-    add_full_record(teds, client=client_values(first_name="Other"))
     add_full_record(teds, client=client_values(source_id="90000005"), episode=episode_values(license="KDADS-1", event_source_id="SHARED"))
     add_full_record(teds, client=client_values(source_id="90000006"), episode=episode_values(license="KDADS-1", event_source_id="SHARED", admit_date="01162024"))
     issues = teds.predict_errors()
-    assert any(i["element"] == "SourceID" and i["record_type"] == "Episode" and i["severity"] == "Error" for i in issues)
-    assert any(i["element"] == "SourceID" and i["record_type"] == "Client" for i in warnings(issues))
     assert any(i["value"] == "SHARED" for i in warnings(issues, "SourceID"))
     assert errors(issues, "ProviderID")[0]["value"] == "KDADS-1"
+    # add_client() holds one client per SourceID, so these repeats now come from files: several <Client>
+    # elements read back for one SourceID. Three separate Client objects stand in for them here.
+    repeats = [add_full_record(make_teds(), client=client_values(first_name=name)) for name in ("Robin", "Robin", "Other")]
+    issues = WellSkyPredictor().predict(repeats, NOW.date())
+    assert any(i["element"] == "SourceID" and i["record_type"] == "Episode" and i["severity"] == "Error" for i in issues)
+    assert any(i["element"] == "SourceID" and i["record_type"] == "Client" for i in warnings(issues))
     # Three Client objects share SourceID 80000001 under one license, so the client is split across elements.
     split = [i for i in warnings(issues, "Client") if(i["client_source_id"] == "80000001")]
     assert "split across 3" in split[0]["message"]
@@ -490,6 +642,26 @@ def test_dry_run_writes_nothing(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_report_only_writes_the_report_and_no_xml(tmp_path):
+    folder = tmp_path / "new" / "out"
+    teds = make_teds(folder, report_only=True)
+    add_full_record(teds, client=client_values(county=""))
+    assert teds.validate()
+    summary = teds.execute()
+    # The summary still lists the files a normal run would have written.
+    assert summary["files"] == ["KDADS_00987654_202609140815.xml"] and summary["clients"] == 1
+    assert [p.name for p in folder.iterdir()] == ["wellsky_predicted_errors.csv"]
+    assert "CountyofResidence" in (folder / "wellsky_predicted_errors.csv").read_text(encoding="utf-8")
+
+
+def test_report_only_and_dry_run_fail_validation(tmp_path):
+    teds = make_teds(tmp_path, dry_run=True, report_only=True)
+    add_full_record(teds)
+    assert not teds.validate()
+    assert teds.execute() is None
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_report_columns(tmp_path):
     teds = make_teds(tmp_path)
     add_full_record(teds, client=client_values(county=""))
@@ -523,3 +695,25 @@ def test_command_line(tmp_path, monkeypatch, capsys):
     main()
     assert "usage:" in capsys.readouterr().out
     assert main(get_args=True).parse_args(["--path", "x"]).dry_run is False
+    assert main(get_args=True).parse_args(["--path", "x"]).report_only is False
+
+
+def test_command_line_report_only(tmp_path, monkeypatch, capsys):
+    teds = make_teds(tmp_path)
+    add_full_record(teds)
+    teds.execute()
+    xml_file = tmp_path / "KDADS_00987654_202609140815.xml"
+    before = xml_file.read_text(encoding="utf-8")
+    (tmp_path / "wellsky_predicted_errors.csv").unlink()
+    monkeypatch.setattr(sys, "argv", ["WellSkyTEDS.py", "--path", str(tmp_path), "--report-only"])
+    main()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["KDADS_00987654_202609140815.xml", "wellsky_predicted_errors.csv"]
+    assert xml_file.read_text(encoding="utf-8") == before
+    assert main(get_args=True).parse_args(["--path", "x", "--report-only"]).report_only is True
+    # Report-only with dry-run fails validation and prints the help.
+    (tmp_path / "wellsky_predicted_errors.csv").unlink()
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "argv", ["WellSkyTEDS.py", "--path", str(tmp_path), "--report-only", "--dry-run"])
+    main()
+    assert "usage:" in capsys.readouterr().out
+    assert not (tmp_path / "wellsky_predicted_errors.csv").exists()

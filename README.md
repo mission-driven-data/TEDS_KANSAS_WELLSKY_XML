@@ -463,6 +463,40 @@ A discharge can also report a substance in a slot that was blank or unknown at a
 episode.add_substance(Substance(rank="S", discharge_substance="01", discharge_frequency="96"))
 ```
 
+### Adding the same thing twice
+
+Each add method checks what it already holds, so a repeat is caught the moment it's added, not later in the report. Each one matches on a key:
+
+| Method | Matches on | A repeat with the same values | A repeat with different values |
+|---|---|---|---|
+| `teds.add_client(client)` | The client's `SourceID` | Isn't added again. Its episodes are added to the client already held, so none are lost. | Is left out, with its episodes. The first is kept, and the report carries a Warning. |
+| `client.add_episode(episode)` | The license and the admission date | Isn't added again. | Is left out. The first is kept, and the report carries a Warning. |
+| `episode.add_substance(substance)` | The rank: P, S or T | Isn't added again. | Is left out. The first is kept, and the report carries a Warning. |
+
+The license is part of an episode's key because one client can have two programs open on the same day, and those aren't repeats.
+
+Each method returns the object it holds. On a repeat that's the first one, so chained calls go to the right place:
+
+```python
+episode = client.add_episode(Episode(license="00934567", admit_date="06032024", ...))
+episode.add_substance(Substance(rank="P", ...))     # lands on the episode already held
+```
+
+An episode added again before its substances or discharge are set, with the same admission values, counts as the same episode. That's what a loop over admissions does when the same admission comes through twice.
+
+A few things never match, so the report can flag them instead:
+
+- a rank that isn't P, S or T is always added, and the report says it isn't P, S or T
+- a blank `SourceID`, license or admission date never matches another one
+
+`in` asks the same question without adding anything. `client in teds`, `episode in client` and `substance in episode` are `True` when one with the same values is already held. Two objects with the same values are equal (`==`).
+
+`teds.clients`, `client.episodes` and `episode.substances` list what's held, in the order it was added. They're read only: add through the methods.
+
+Each repeat writes one log line, with no client information: Info when it was the same, Warning when the values differed.
+
+When it checks files that already exist, it keeps every episode it reads, even two with the same license and admission date, so each is checked as WellSky will see it.
+
 ### Values
 
 - **Pass codes as strings, exactly as WellSky lists them**: `"05"`, not `5`. Numbers are accepted, but `5` is sent as `5`, and WellSky's Race code is `05`. The report catches this and suggests the right code.
@@ -518,6 +552,7 @@ These defaults follow the layout, or what working WellSky exports do. Pass a val
 | `path` | none | The folder for the run: the XML files and the report are written here. Created if it doesn't exist. Required. |
 | `exclude_errors` | `False` | When `True`, leaves out of the XML every episode with a predicted Error. By default everything is written, and the report says what is likely to be rejected. |
 | `dry_run` | `False` | Builds and checks everything, logs the counts, and writes nothing. |
+| `report_only` | `False` | Builds and checks everything and writes the predicted error report, but no XML. Can't be used with `dry_run`. |
 | `now` | current time | The time used for `ReportingDate` and the file names. |
 | `monitor` | none | A hook for plugging in your own logger: any object with an `add_log(log_system, log_category, log_subcategory, log_line)` method. You can ignore it. |
 
@@ -549,7 +584,7 @@ for person in read_clients():                   # your code: read clients from y
 summary = teds.execute()                        # one report for everything added
 ```
 
-One `WellSkyTEDS` collects every client you add. `execute()` checks them all together and writes one report for the whole run, plus one XML file per license. To check a run without writing anything, pass `dry_run=True`.
+One `WellSkyTEDS` collects every client you add. `execute()` checks them all together and writes one report for the whole run, plus one XML file per license. To check a run without writing anything, pass `dry_run=True`. To get the report without the XML, pass `report_only=True`.
 
 To schedule it or hand it to someone, a `.bat` file runs your script like any other Python:
 
@@ -609,7 +644,7 @@ Each problem becomes one row in `wellsky_predicted_errors.csv`, Errors first, th
 | **WellSky layout v13** | The WellSky SUD Custom TEDS Import Layout v13: required elements, code lists, formats, the Detailed Drug Code Map, the conditional rules. | Error (a few layout notes that only advise are Warnings) |
 | **WellSky provider instructions** | WellSky's TEDS Import Instructions for Providers (03/16/2026): leading zeros must be included, all of a client's records in one `<Client>`, nothing but the license in the file name, questions not to answer. | Error, or Warning where the instruction only advises |
 | **Data integrity** | The data contradicts itself: a discharge dated before its admission, an admission before the birth date, the same episode twice. | Error (Warning where only a person can judge) |
-| **MDD reading of layout v13** | Mission Driven Data's reading of places where the layout is unclear, or where working exports do something else, so it isn't yet clear which way WellSky goes. Example: repeated 97 (Unknown) substances, which working exports send routinely. | Warning |
+| **MDD reading of layout v13** | Mission Driven Data's reading of places where the layout is unclear, or where working exports do something else, so it isn't yet clear which way WellSky goes. Example: a substance repeated at discharge, where the layout's detailed-drug-code exception can't be checked because discharges carry no detailed drug codes. | Warning |
 | **KDADS KSURS-era edit** | Checks KDADS ran on uploads to KSURS, its earlier TEDS system: age of first use greater than the client's age, dates in the future, last contact outside the episode. WellSky may or may not run them. | Warning |
 
 ### Every check
@@ -652,10 +687,11 @@ Each problem becomes one row in `wellsky_predicted_errors.csv`, Errors first, th
 | A reported substance missing its detailed drug code, route, frequency or age of first use. At discharge, a substance without a frequency, or a frequency without a substance. | Error | Required field not populated |
 | Route, frequency or age of first use is 96 when the substance isn't 01, or isn't 96 when it is. | Error | Value not applicable unless Substance is None (01) |
 | A detailed drug code that belongs to a different substance, such as 0401 under substance 02. | Error | Value not applicable to selected Substance |
-| The same substance and detailed drug code in two slots. 01 may repeat. A repeated 97, or a repeat at discharge (which carries no drug codes), is a Warning. | Error / Warning | Duplicate Substance Codes not allowed unless Detailed Drug Codes are different |
+| The same substance and detailed drug code in two slots. 01 (None) and 97 (Unknown) may repeat; the state has accepted records with 97 in more than one slot. A repeat of any other code at discharge (which carries no drug codes) is a Warning. | Error / Warning | Duplicate Substance Codes not allowed unless Detailed Drug Codes are different |
 | No Primary substance. Not required for collateral clients. | Error | Required field not populated |
 | An Admission with a ClientTransactionType other than A or T, or a Discharge with one other than D. | Error | Invalid value |
-| Two substances with the same rank (only the last is written), or a rank that isn't P, S or T. | Error | Data integrity |
+| A rank that isn't P, S or T. | Error | Data integrity |
+| The same client SourceID, the same episode (license and admission date) or the same substance rank added again with different values. The first is kept and the repeat is left out (see [Adding the same thing twice](#adding-the-same-thing-twice)). | Warning | Data integrity |
 | The discharge dated before the admission, an admission before the birth date, or a birth date in the future. | Error | Data integrity |
 | Age of first use greater than the client's age at admission. | Warning | Likely KDADS edit |
 | An admission or discharge date in the future, or a last contact after the discharge, before the admission, or before 01/01/2000. | Warning | Likely KDADS edit |
@@ -698,6 +734,7 @@ From the command line, it checks WellSky XML that already exists: an EHR's expor
 ```
 wellsky-teds --path "C:\TEDS\Out"
 wellsky-teds --path "C:\TEDS\Out" --dry-run
+wellsky-teds --path "C:\TEDS\Out" --report-only
 ```
 
 If you copied the file instead of installing it, run `python WellSkyTEDS.py` with the same flags.
@@ -706,6 +743,7 @@ If you copied the file instead of installing it, run `python WellSkyTEDS.py` wit
 |---|---|
 | `--path` | The folder of `.xml` files to check. The report is written there too. Required. |
 | `--dry-run` | Check and log counts; write nothing. |
+| `--report-only` | Check and write the predicted error report, but no XML. Can't be used with `--dry-run`. From the command line the files are only checked, so this writes the same report a plain run does. |
 
 Every log line is always printed. They hold counts and file names, never client information. To keep them, redirect the output: `wellsky-teds --path "C:\TEDS\Out" > check.log`.
 
@@ -856,7 +894,7 @@ Working WellSky exports don't always follow WellSky's documents to the letter, a
 | `ReasonForDischarge` **97**. | Layout: 97 isn't in the list (01–07, 14, 24), though the layout's not-answered note says 97. | Error |
 | `SenateBill6Secondary` **2**. | Layout: only 0 and 1. | Error |
 | `Tobacco30` answered when `TobaccoUse` is 2. | Provider instructions: don't answer it then. | Warning |
-| Secondary and Tertiary both **97 / 9997**. | Layout: no repeated substance unless the detailed drug codes differ. | Warning only, since exports do this routinely. |
+| Secondary and Tertiary both **97 / 9997**. | Layout: no repeated substance unless the detailed drug codes differ. | Not reported. Exports do this routinely, and the state has accepted records with a repeated 97. |
 | `State` in capitals, such as **KANSAS**. | Layout: a US state name. | Accepted; case doesn't matter. |
 | 8-digit licenses with leading zeros (`00987654`). | Provider instructions' example file name: `KDADS_0012345_…`, 7 characters. | Sends the license exactly as you give it and never pads it. Use the license as KDADS issued it. |
 | ProviderID filled with the license. | Interface: WellSky matches ProviderID to its own provider (vendor) number. | Sends the license unless you pass `provider_id`. |

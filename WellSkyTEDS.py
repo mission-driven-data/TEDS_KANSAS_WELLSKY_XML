@@ -23,7 +23,9 @@ A caller builds records from three objects and hands them to WellSkyTEDS:
 
 Records can be built one object at a time (Client, Episode, Substance, then
 attach them), or a whole client at once with WellSkyTEDS.add_record() from
-plain dicts. Both produce the same objects and the same XML.
+plain dicts. Both produce the same objects and the same XML. The add methods
+hold one object per key (client SourceID; episode license and admission date;
+substance rank) and catch a repeat as it is added.
 
 Classes in this file:
 
@@ -485,6 +487,19 @@ class Substance:
         }
         self.episode = None
 
+    # Objects compare by their values, so a hash by identity keeps them usable in sets and as dict keys.
+    __hash__ = object.__hash__
+
+    def __eq__(self, other):
+        """
+        True when the other substance has the same rank, admission values and discharge values.
+
+        :param other: Another Substance.
+        """
+        if(not isinstance(other, Substance)):
+            return NotImplemented
+        return (self.rank, self.values, self.discharge_values) == (other.rank, other.values, other.discharge_values)
+
     def slot(self):
         """
         The element prefix for this rank: 'Primary', 'Secondary', 'Tertiary', or '' for an unknown rank.
@@ -593,7 +608,8 @@ class Client:
                  ,medicaid_number=None
                  ,ssn=None
                  ,aso=None
-                 ,rules=None):
+                 ,rules=None
+                 ,monitor=None):
         """
         One person, written as <Client>. The client is written again for every episode, as in a working WellSky export.
 
@@ -617,7 +633,12 @@ class Client:
         :param ssn: SSN, written ###-##-####.
         :param aso: ASO.
         :param rules: A WellSkyRules to share. One is made when not given.
+        :param monitor: Optional injected monitor for the lines logged when an episode is added twice.
+            Defaults to the WellSkyTEDS monitor once the client is added there; until then lines are printed.
         """
+        # Set up the monitor
+        self.monitor = monitor
+
         # Class Objects
         self.rules = rules or WellSkyRules()
 
@@ -644,17 +665,89 @@ class Client:
             ,"SSN": text(ssn)
             ,"ASO": text(aso)
         }
-        self.episodes = []
+        # Keyed by Episode.key(), so a second add of the same episode is caught as it is added.
+        self.episodes_by_key = {}
+        # Repeats that were added with different values and left out: ('Client', None) for this client
+        # added again to WellSkyTEDS, ('Episode', key) for an episode. Each becomes a Warning in the report.
+        self.conflicts = []
+
+    # Objects compare by their values, so a hash by identity keeps them usable in sets and as dict keys.
+    __hash__ = object.__hash__
+
+    def __eq__(self, other):
+        """
+        True when the other client has the same values. Episodes are not compared: adding an equal client
+        to WellSkyTEDS merges its episodes into the one already held.
+
+        :param other: Another Client.
+        """
+        if(not isinstance(other, Client)):
+            return NotImplemented
+        return self.values == other.values
+
+    def __contains__(self, episode):
+        """
+        True when an episode equal to this one is already held: `episode in client`.
+
+        :param episode: An Episode.
+        """
+        return any(held == episode for held in self.episodes_by_key.values())
+
+    @property
+    def episodes(self):
+        """
+        This client's episodes, in the order they were added. Read only: add them with add_episode().
+        """
+        return tuple(self.episodes_by_key.values())
+
+    def log(self, category, severity, line):
+        """
+        Logs one line through this client's monitor, or prints it when the client has none yet.
+
+        :param category: The method, in Title Case.
+        :param severity: 'Info' or 'Warning'.
+        :param line: The detail. Never include client information.
+        """
+        (self.monitor or ConsoleMonitor()).add_log(log_system="Client", log_category=category, log_subcategory=severity, log_line=line)
 
     def add_episode(self, episode):
         """
-        Attaches an episode to this client.
+        Attaches an episode to this client, unless one with the same license and admission date is already held.
+        A repeat with the same values (or with only its admission values given so far) is not added again.
+        A repeat with different values is left out too, and the report carries a Warning.
 
         :param episode: An Episode.
-        :return: The episode, so calls can be chained.
+        :return: The episode held: the one given, or the one already held under its key, so calls can be chained.
         """
+        key = episode.key()
+        if(not all(key)):
+            # A blank license or admission date never matches another episode; the report flags the blank.
+            key = key + (len(self.episodes_by_key),)
+        held = self.episodes_by_key.get(key)
+        if(held is None):
+            episode.client = self
+            self.episodes_by_key[key] = episode
+            return episode
+        if(held is episode or held == episode or (episode.is_bare() and held.own_values() == episode.own_values())):
+            self.log("Add Episode", "Info", "An equal episode with the same license and admission date is already held; the repeat was not added.")
+            return held
+        self.conflicts.append(("Episode", key))
+        self.log("Add Episode", "Warning", "An episode with the same license and admission date but different values was left out; the first one is kept.")
+        return held
+
+    def read_episode(self, episode):
+        """
+        Attaches an episode read from a file. Every episode in the file is kept, even two with the same
+        license and admission date, so that each one is checked as WellSky will see it.
+
+        :param episode: An Episode.
+        :return: The episode.
+        """
+        key = episode.key()
+        if(key in self.episodes_by_key):
+            key = key + (len(self.episodes_by_key),)
         episode.client = self
-        self.episodes.append(episode)
+        self.episodes_by_key[key] = episode
         return episode
 
     def context(self):
@@ -665,7 +758,8 @@ class Client:
 
     def predict_errors(self, today=None):
         """
-        This client's own predicted errors: required elements, codes and formats, and a birth date in the future.
+        This client's own predicted errors: required elements, codes and formats, a birth date in the future,
+        and repeats of this client or its episodes that were left out because their values differed.
 
         :param today: The date the file is made, for the future-date check. Defaults to today.
         :return: List of issue dicts.
@@ -676,6 +770,13 @@ class Client:
         born = self.rules.as_date(self.values["DOB"])
         if(born and born > today):
             issues.append(self.rules.issue(context, "DOB", "integrity", "The birth date is in the future.", "Error", self.rules.source_integrity))
+        for element, key in self.conflicts:
+            if(element == "Client"):
+                issues.append(self.rules.issue(context, "Client", "integrity", "This client SourceID was added again with different values. The first was kept and the repeat was left out, with its episodes.", "Warning", self.rules.source_integrity))
+                continue
+            held = self.episodes_by_key[key]
+            episode_context = {"record_type": "Episode", "license": held.license, "client_source_id": self.values["SourceID"], "episode_source_id": held.source_id()}
+            issues.append(self.rules.issue(episode_context, "Episode", "integrity", "An episode with this license and admission date was added again with different values. The first was kept and the repeat was left out.", "Warning", self.rules.source_integrity, held.values["DateOfAdmission"]))
         return issues
 
     def validate(self):
@@ -742,7 +843,8 @@ class Episode:
                  ,moud=None
                  ,diagnosis=None
                  ,provider_id=None
-                 ,rules=None):
+                 ,rules=None
+                 ,monitor=None):
         """
         One treatment episode: its admission and, after set_discharge(), its discharge.
 
@@ -805,7 +907,12 @@ class Episode:
         :param provider_id: ProviderID, when WellSky knows the provider by a number other than its license.
             Defaults to the license.
         :param rules: A WellSkyRules to share. One is made when not given.
+        :param monitor: Optional injected monitor for the lines logged when a substance rank is added twice.
+            Defaults to the client's monitor once the episode is attached; until then lines are printed.
         """
+        # Set up the monitor
+        self.monitor = monitor
+
         # Class Objects
         self.rules = rules or WellSkyRules()
 
@@ -875,21 +982,93 @@ class Episode:
         # Filled by set_discharge(). Record elements the discharge doesn't hold are taken from the admission.
         self.discharge_values = None
         self.discharge_event_values = None
-        self.substances = []
+        # Keyed by rank (P, S or T), so a second substance of the same rank is caught as it is added.
+        self.substances_by_rank = {}
         self.client = None
         # False only for a discharge read from a file that doesn't hold its admission.
         self.admission_included = True
+        # Ranks added again with different values and left out. Each becomes a Warning in the report.
+        self.conflicts = []
+
+    # Objects compare by their values, so a hash by identity keeps them usable in sets and as dict keys.
+    __hash__ = object.__hash__
+
+    def __eq__(self, other):
+        """
+        True when the other episode sends the same thing: the same admission values, discharge and substances.
+
+        :param other: Another Episode.
+        """
+        if(not isinstance(other, Episode)):
+            return NotImplemented
+        return (self.own_values(), self.discharge_values, self.discharge_event_values, self.substances_by_rank) == (other.own_values(), other.discharge_values, other.discharge_event_values, other.substances_by_rank)
+
+    def __contains__(self, substance):
+        """
+        True when a substance equal to this one is already held: `substance in episode`.
+
+        :param substance: A Substance.
+        """
+        return any(held == substance for held in self.substances_by_rank.values())
+
+    @property
+    def substances(self):
+        """
+        This episode's substances, in the order they were added. Read only: add them with add_substance().
+        """
+        return tuple(self.substances_by_rank.values())
+
+    def key(self):
+        """
+        What makes two episodes of one client the same episode: the license and the admission date.
+        One client can have two programs open on the same day, so the license is part of it.
+        """
+        return (self.license, self.values["DateOfAdmission"])
+
+    def own_values(self):
+        """
+        The episode's admission values, without its discharge or substances.
+        """
+        return (self.license, self.values, self.event_values, self.admission_included)
+
+    def is_bare(self):
+        """
+        True when only the admission values are given so far: no substances and no discharge.
+        """
+        return not self.substances_by_rank and self.discharge_values is None
+
+    def log(self, category, severity, line):
+        """
+        Logs one line through this episode's monitor, its client's, or prints it when there is neither.
+
+        :param category: The method, in Title Case.
+        :param severity: 'Info' or 'Warning'.
+        :param line: The detail. Never include client information.
+        """
+        monitor = self.monitor or (self.client.monitor if(self.client) else None) or ConsoleMonitor()
+        monitor.add_log(log_system="Episode", log_category=category, log_subcategory=severity, log_line=line)
 
     def add_substance(self, substance):
         """
-        Attaches a ranked substance to this episode.
+        Attaches a ranked substance to this episode, unless one of the same rank is already held.
+        A repeat with the same values is not added again. A repeat with different values is left out too,
+        and the report carries a Warning. A rank that isn't P, S or T is always added, so the report flags it.
 
         :param substance: A Substance.
-        :return: The substance, so calls can be chained.
+        :return: The substance held: the one given, or the one already held at its rank, so calls can be chained.
         """
-        substance.episode = self
-        self.substances.append(substance)
-        return substance
+        key = substance.rank if(substance.slot()) else (substance.rank, len(self.substances_by_rank))
+        held = self.substances_by_rank.get(key)
+        if(held is None):
+            substance.episode = self
+            self.substances_by_rank[key] = substance
+            return substance
+        if(held == substance):
+            self.log("Add Substance", "Info", f"An equal substance ranked {key} is already held; the repeat was not added.")
+            return held
+        self.conflicts.append(key)
+        self.log("Add Substance", "Warning", f"A substance ranked {key} with different values was left out; the first one is kept.")
+        return held
 
     def set_discharge(self
                       ,discharge_date
@@ -1005,9 +1184,13 @@ class Episode:
             issues.append(self.rules.issue(self.context("Admission"), "Client", "integrity", "The episode isn't attached to a client, so it can't be written.", "Error", self.rules.source_integrity))
         if(not self.admission_included):
             issues.append(self.rules.issue(self.context("Discharge"), "Admission", "no-admission", "This file holds the discharge without its admission. WellSky accepts it only if the admission was sent before.", "Warning"))
+        # add_substance() holds one substance per P, S or T rank, so a repeat of one of those is only reached
+        # when a rank is changed after it was added. A rank that isn't P, S or T can still repeat.
         ranks = [s.rank for s in self.substances]
         for rank in sorted({r for r in ranks if(ranks.count(r) > 1)}):
             issues.append(self.rules.issue(self.context("Admission"), "Substance", "integrity", f"More than one substance is ranked {rank}; only the last one is written.", "Error", self.rules.source_integrity, rank))
+        for rank in self.conflicts:
+            issues.append(self.rules.issue(self.context("Admission"), "Substance", "integrity", f"A second substance ranked {rank} was added with different values. The first was kept and the repeat was left out.", "Warning", self.rules.source_integrity, rank))
 
         for record_type in self.record_types():
             context = self.context(record_type)
@@ -1090,8 +1273,9 @@ class Episode:
     def duplicate_errors(self, record_type, event, context):
         """
         The layout's rule that a substance can't repeat across Primary, Secondary and Tertiary unless
-        the detailed drug codes differ. 01 (None) may repeat. 97 (Unknown) repeats in a working WellSky export,
-        so a repeated 97 is only a Warning.
+        the detailed drug codes differ. 01 (None) and 97 (Unknown) may repeat: the state accepted records with
+        97 in more than one slot. At discharge any other repeat is only a Warning, because discharges carry
+        no detailed drug codes.
 
         :param record_type: 'Admission' or 'Discharge'.
         :param event: The TreatmentEvent values.
@@ -1103,10 +1287,10 @@ class Episode:
         for slot in self.rules.slots.values():
             substance = event.get(f"{slot}Substance", "")
             pair = (substance, event.get(f"{slot}DetailedDrugCode", ""))
-            if(substance and substance != "01" and pair in seen):
-                unknown = substance == "97" or record_type == "Discharge"
-                note = " Discharges carry no detailed drug codes, so this is only a guess." if(record_type == "Discharge") else ""
-                issues.append(self.rules.issue(context, f"{slot}Substance", "duplicate-substance", f"Substance {substance} repeats an earlier slot with the same detailed drug code.{note}", "Warning" if(unknown) else "Error", self.rules.source_reading if(unknown) else None, substance))
+            if(substance and substance not in ("01", "97") and pair in seen):
+                discharge = record_type == "Discharge"
+                note = " Discharges carry no detailed drug codes, so this is only a guess." if(discharge) else ""
+                issues.append(self.rules.issue(context, f"{slot}Substance", "duplicate-substance", f"Substance {substance} repeats an earlier slot with the same detailed drug code.{note}", "Warning" if(discharge) else "Error", self.rules.source_reading if(discharge) else None, substance))
             seen.append(pair)
         return issues
 
@@ -1331,6 +1515,7 @@ class WellSkyTEDS:
                  ,path=None
                  ,exclude_errors=False
                  ,dry_run=False
+                 ,report_only=False
                  ,now=None
                  ,monitor=None):
         """
@@ -1343,6 +1528,8 @@ class WellSkyTEDS:
         :param exclude_errors: When True, leave out of the XML every episode with a predicted Error.
             Default False: everything is written, and the report says what WellSky is likely to reject.
         :param dry_run: When True, build and check everything, log counts, and write nothing.
+        :param report_only: When True, build and check everything and write the predicted error report into
+            path, but no XML. Cannot be combined with dry_run.
         :param now: Datetime used for ReportingDate and the file names. Defaults to the current time.
         :param monitor: Optional injected monitor with an add_log method and a verbose attribute.
         """
@@ -1353,13 +1540,15 @@ class WellSkyTEDS:
         self.cli_path = Path(path) if(path) else None
         self.cli_exclude_errors = exclude_errors
         self.cli_dry_run = dry_run
+        self.cli_report_only = report_only
         self.cli_now = now or datetime.datetime.now()
 
         # Class Data
         self.report_file = "wellsky_predicted_errors.csv"
         self.file_pattern = "KDADS_{license}_{stamp}.xml"
         # Clients added in code are written; clients read from the files in path are only checked.
-        self.clients = []
+        # Added clients are keyed by SourceID, so a second add of the same client is caught as it is added.
+        self.clients_by_id = {}
         self.read_clients = []
         self.issues = []
         self.summary = {}
@@ -1368,15 +1557,63 @@ class WellSkyTEDS:
         self.rules = WellSkyRules()
         self.predictor = WellSkyPredictor(rules=self.rules, monitor=self.monitor)
 
-    def add_client(self, client):
+    def __contains__(self, client):
         """
-        Adds a client, with its episodes and substances, to the file.
+        True when a client equal to this one has been added: `client in teds`.
 
         :param client: A Client.
-        :return: The client, so calls can be chained.
         """
-        self.clients.append(client)
-        return client
+        held = self.clients_by_id.get(client.values["SourceID"])
+        if(held is not None and held == client):
+            return True
+        return not client.values["SourceID"] and any(c == client for c in self.clients_by_id.values())
+
+    @property
+    def clients(self):
+        """
+        The clients added in code, in the order they were added. Read only: add them with add_client().
+        """
+        return tuple(self.clients_by_id.values())
+
+    def add_client(self, client):
+        """
+        Adds a client, with its episodes and substances, to the file, unless a client with the same SourceID
+        is already held. A repeat with the same values is not added again, but its episodes are added to the
+        client already held, so none are lost. A repeat with different values is left out, with its episodes,
+        and the report carries a Warning.
+
+        :param client: A Client.
+        :return: The client held: the one given, or the one already held under its SourceID, so calls can be chained.
+        """
+        key = client.values["SourceID"]
+        if(not key):
+            # A blank SourceID never matches another client; the report flags the blank.
+            key = ("", len(self.clients_by_id))
+        held = self.clients_by_id.get(key)
+        if(held is None):
+            if(client.monitor is None):
+                client.monitor = self.monitor
+            self.clients_by_id[key] = client
+            return client
+        if(held is client):
+            self.log("Info", "This client is already held; it was not added again.")
+        elif(held == client):
+            self.log("Info", "An equal client with the same SourceID is already held; its episodes were added to that one.")
+            for episode in client.episodes:
+                held.add_episode(episode)
+        else:
+            held.conflicts.append(("Client", None))
+            self.log("Warning", "A client with the same SourceID but different values was left out, with its episodes; the first one is kept.")
+        return held
+
+    def log(self, severity, line):
+        """
+        Logs one Add Client line.
+
+        :param severity: 'Info' or 'Warning'.
+        :param line: The detail. Never include client information.
+        """
+        self.monitor.add_log(log_system="WellSkyTEDS", log_category="Add Client", log_subcategory=severity, log_line=line)
 
     def add_record(self, client, episodes=None):
         """
@@ -1386,9 +1623,9 @@ class WellSkyTEDS:
 
         :param client: Dict of Client values, e.g. {"source_id": "80000001", "last_name": "Doe", ...}.
         :param episodes: List of dicts of Episode values, each with optional 'substances' and 'discharge'.
-        :return: The Client built.
+        :return: The Client held: the one built, or the one already held under its SourceID (see add_client()).
         """
-        person = Client(**client, rules=self.rules)
+        person = Client(**client, rules=self.rules, monitor=self.monitor)
         for item in episodes or []:
             values = dict(item)
             substances = values.pop("substances", [])
@@ -1406,7 +1643,7 @@ class WellSkyTEDS:
 
         :return: List of issue dicts.
         """
-        self.issues = self.predictor.predict(self.clients + self.read_clients, self.cli_now.date())
+        self.issues = self.predictor.predict(list(self.clients) + self.read_clients, self.cli_now.date())
         return self.issues
 
     def add_elements(self, parent, fields, values):
@@ -1530,7 +1767,7 @@ class WellSkyTEDS:
             source_id = record_values.get("SourceID", "")
             episode = by_source.get(source_id)
             if(episode is None):
-                episode = client.add_episode(Episode(license=record_values.get("ProviderID", ""), admit_date=record_values.get("DateOfAdmission", ""), rules=self.rules))
+                episode = client.read_episode(Episode(license=record_values.get("ProviderID", ""), admit_date=record_values.get("DateOfAdmission", ""), rules=self.rules))
                 episode.values.update({k: v for k, v in record_values.items() if(k in episode.values)})
                 by_source[source_id] = episode
                 episode.admission_included = record.tag == "Admission"
@@ -1611,7 +1848,7 @@ class WellSkyTEDS:
             self.read_clients = self.read_xml(self.cli_path)
         self.predict_errors()
         files = self.build_files() if(self.clients) else {}
-        self.summary = self.predictor.summarize(self.issues, self.clients + self.read_clients, files)
+        self.summary = self.predictor.summarize(self.issues, list(self.clients) + self.read_clients, files)
         self.predictor.log_summary(self.summary)
         if(self.cli_dry_run):
             self.monitor.add_log(
@@ -1622,6 +1859,15 @@ class WellSkyTEDS:
             )
             return self.summary
         self.cli_path.mkdir(parents=True, exist_ok=True)
+        if(self.cli_report_only):
+            self.predictor.write_report(self.issues, self.cli_path / self.report_file)
+            self.monitor.add_log(
+                log_system="WellSkyTEDS"
+                ,log_category="Execute"
+                ,log_subcategory="Report Only"
+                ,log_line=f"Report only: wrote the predicted error report. {len(files)} XML file(s) left unwritten."
+            )
+            return self.summary
         self.write_outputs(files, self.cli_path)
         return self.summary
 
@@ -1635,6 +1881,15 @@ class WellSkyTEDS:
         verbose = self.monitor.verbose
         self.monitor.verbose = True
         valid = True
+
+        if(self.cli_dry_run and self.cli_report_only):
+            self.monitor.add_log(
+                log_system="WellSkyTEDS"
+                ,log_category="Validate"
+                ,log_subcategory="Settings Conflict"
+                ,log_line="--dry-run and --report-only cannot be used together: a dry run writes nothing, a report-only run writes the report."
+            )
+            valid = False
 
         if(self.cli_path is None):
             self.monitor.add_log(
@@ -1715,6 +1970,7 @@ def main(get_args=False):
 
     behavior = parser.add_argument_group("Behavior")
     behavior.add_argument("--dry-run", action="store_true", default=False, help="Check everything, log counts, and write nothing.")
+    behavior.add_argument("--report-only", action="store_true", default=False, help="Check everything and write the predicted error report, but no XML.")
     if(get_args):
         return parser
 
@@ -1725,6 +1981,7 @@ def main(get_args=False):
     go = WellSkyTEDS(
         path=args.path
         ,dry_run=args.dry_run
+        ,report_only=args.report_only
     )
     if(not go.validate()):
         parser.print_help()
