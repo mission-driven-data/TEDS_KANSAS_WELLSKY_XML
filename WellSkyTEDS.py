@@ -38,7 +38,8 @@ Classes in this file:
   them and writes the predicted error report (CSV).
 - WellSkyTEDS: collects clients, writes one KDADS_[license]_yyyyMMddHHmm.xml
   per license, reads existing WellSky XML back in, and from the command line
-  checks the XML files in a folder.
+  checks the XML files in a folder. Include and exclude filters on client
+  SourceIDs and location license numbers pick which records a run covers.
 
 It needs Python 3.9 or later and nothing else. The XML and the report hold
 client information, so write them only to a location approved for PHI.
@@ -1516,6 +1517,10 @@ class WellSkyTEDS:
                  ,exclude_errors=False
                  ,dry_run=False
                  ,report_only=False
+                 ,include_client_ids=None
+                 ,exclude_client_ids=None
+                 ,include_location_ids=None
+                 ,exclude_location_ids=None
                  ,now=None
                  ,monitor=None):
         """
@@ -1530,6 +1535,17 @@ class WellSkyTEDS:
         :param dry_run: When True, build and check everything, log counts, and write nothing.
         :param report_only: When True, build and check everything and write the predicted error report into
             path, but no XML. Cannot be combined with dry_run.
+        :param include_client_ids: Client SourceIDs to keep; every other client is left out. A comma-separated
+            string or a list. Cannot be combined with exclude_client_ids.
+        :param exclude_client_ids: Client SourceIDs to leave out. A comma-separated string or a list.
+        :param include_location_ids: Location license numbers to keep (the episode's license, which names the
+            file and is sent as ProviderID); episodes at every other location are left out. A comma-separated
+            string or a list. Cannot be combined with exclude_location_ids.
+        :param exclude_location_ids: Location license numbers whose episodes are left out. A comma-separated
+            string or a list.
+            All four filters match exactly, without regard to case, and are applied before anything is checked
+            or built, so what they leave out is in neither the XML nor the report. A client left with no
+            episodes by a location filter is left out too.
         :param now: Datetime used for ReportingDate and the file names. Defaults to the current time.
         :param monitor: Optional injected monitor with an add_log method and a verbose attribute.
         """
@@ -1541,6 +1557,10 @@ class WellSkyTEDS:
         self.cli_exclude_errors = exclude_errors
         self.cli_dry_run = dry_run
         self.cli_report_only = report_only
+        self.cli_include_client_ids = self.parse_ids(include_client_ids)
+        self.cli_exclude_client_ids = self.parse_ids(exclude_client_ids)
+        self.cli_include_location_ids = self.parse_ids(include_location_ids)
+        self.cli_exclude_location_ids = self.parse_ids(exclude_location_ids)
         self.cli_now = now or datetime.datetime.now()
 
         # Class Data
@@ -1552,10 +1572,130 @@ class WellSkyTEDS:
         self.read_clients = []
         self.issues = []
         self.summary = {}
+        # What the include and exclude filters have left out so far. Counts only.
+        self.filtered_out = {"clients": 0, "episodes": 0}
+        # The IDs that matched nothing are counted against everything held the first time the filters run.
+        self.unmatched_logged = False
 
         # Class Objects
         self.rules = WellSkyRules()
         self.predictor = WellSkyPredictor(rules=self.rules, monitor=self.monitor)
+
+    def parse_ids(self, value):
+        """
+        One include or exclude list as a list of IDs: split on commas, trimmed, blanks dropped.
+
+        :param value: None, a comma-separated string, or an iterable of IDs.
+        :return: None when the filter isn't given, otherwise the list of IDs (possibly empty, which validate() refuses).
+        """
+        if(value is None):
+            return None
+        parts = value.split(",") if(isinstance(value, str)) else value
+        return [text for text in (str(part).strip() for part in parts if(part is not None)) if(text)]
+
+    def filters_active(self):
+        """
+        True when any include or exclude filter is given.
+        """
+        return any(ids is not None for ids in (self.cli_include_client_ids, self.cli_exclude_client_ids, self.cli_include_location_ids, self.cli_exclude_location_ids))
+
+    def keep_client(self, client):
+        """
+        True when the client filters keep this client.
+
+        :param client: A Client.
+        """
+        source_id = client.values["SourceID"].casefold()
+        if(self.cli_include_client_ids is not None):
+            return source_id in {i.casefold() for i in self.cli_include_client_ids}
+        if(self.cli_exclude_client_ids is not None):
+            return source_id not in {i.casefold() for i in self.cli_exclude_client_ids}
+        return True
+
+    def keep_episode(self, episode):
+        """
+        True when the location filters keep this episode. The location is the episode's license.
+
+        :param episode: An Episode.
+        """
+        location = episode.license.casefold()
+        if(self.cli_include_location_ids is not None):
+            return location in {i.casefold() for i in self.cli_include_location_ids}
+        if(self.cli_exclude_location_ids is not None):
+            return location not in {i.casefold() for i in self.cli_exclude_location_ids}
+        return True
+
+    def filter_clients(self, clients):
+        """
+        Applies the include and exclude filters to a list of clients. Episodes at a location the filters leave
+        out are taken off their client, and a client left with no episodes by that is dropped with them.
+
+        :param clients: Client objects.
+        :return: The clients kept, in the same order.
+        """
+        kept = []
+        for client in clients:
+            if(not self.keep_client(client)):
+                self.filtered_out["clients"] += 1
+                self.filtered_out["episodes"] += len(client.episodes)
+                continue
+            removed = [key for key, episode in client.episodes_by_key.items() if(not self.keep_episode(episode))]
+            if(removed):
+                for key in removed:
+                    del client.episodes_by_key[key]
+                client.conflicts = [c for c in client.conflicts if(c[0] != "Episode" or c[1] in client.episodes_by_key)]
+                self.filtered_out["episodes"] += len(removed)
+                if(not client.episodes_by_key):
+                    self.filtered_out["clients"] += 1
+                    continue
+            kept.append(client)
+        return kept
+
+    def apply_filters(self):
+        """
+        Applies the include and exclude filters to the clients added in code and to any read from files,
+        so that what they leave out is in neither the XML nor the report. Safe to call more than once.
+        Logs counts, and how many listed IDs matched nothing, never which ones.
+
+        :return: Dict of {"clients": n, "episodes": n} left out by the filters so far.
+        """
+        if(not self.filters_active()):
+            return self.filtered_out
+        before = dict(self.filtered_out)
+        everyone = list(self.clients_by_id.values()) + self.read_clients
+        unmatched = []
+        if(not self.unmatched_logged):
+            client_ids = {c.values["SourceID"].casefold() for c in everyone}
+            locations = {e.license.casefold() for c in everyone for e in c.episodes}
+            for label, ids, seen in (
+                ("--include-client-ids", self.cli_include_client_ids, client_ids)
+                ,("--exclude-client-ids", self.cli_exclude_client_ids, client_ids)
+                ,("--include-location-ids", self.cli_include_location_ids, locations)
+                ,("--exclude-location-ids", self.cli_exclude_location_ids, locations)
+            ):
+                if(ids is not None):
+                    missing = sum(1 for i in {i.casefold() for i in ids} if(i not in seen))
+                    if(missing):
+                        unmatched.append(f"{missing} of {label}")
+        kept = set(map(id, self.filter_clients(list(self.clients_by_id.values()))))
+        self.clients_by_id = {key: client for key, client in self.clients_by_id.items() if(id(client) in kept)}
+        self.read_clients = self.filter_clients(self.read_clients)
+        if(self.filtered_out != before):
+            self.monitor.add_log(
+                log_system="WellSkyTEDS"
+                ,log_category="Apply Filters"
+                ,log_subcategory="Left Out"
+                ,log_line=f"{self.filtered_out['clients'] - before['clients']} client(s) and {self.filtered_out['episodes'] - before['episodes']} episode(s) left out by the include and exclude filters."
+            )
+        self.unmatched_logged = True
+        if(unmatched):
+            self.monitor.add_log(
+                log_system="WellSkyTEDS"
+                ,log_category="Apply Filters"
+                ,log_subcategory="Warning"
+                ,log_line=f"Listed IDs that matched nothing: {', '.join(unmatched)}."
+            )
+        return self.filtered_out
 
     def __contains__(self, client):
         """
@@ -1640,9 +1780,11 @@ class WellSkyTEDS:
     def predict_errors(self):
         """
         Every predicted error for the clients added so far and any read from the files in path, Errors first.
+        The include and exclude filters are applied first.
 
         :return: List of issue dicts.
         """
+        self.apply_filters()
         self.issues = self.predictor.predict(list(self.clients) + self.read_clients, self.cli_now.date())
         return self.issues
 
@@ -1703,9 +1845,11 @@ class WellSkyTEDS:
         """
         One file per license. With exclude_errors, episodes with a predicted Error are left out.
         Episodes with no license can't be named into a file and are left out (the report flags them).
+        The include and exclude filters are applied first.
 
         :return: Dict of {file name: XML text}.
         """
+        self.apply_filters()
         by_license = {}
         skipped = 0
         for client in self.clients:
@@ -1849,6 +1993,7 @@ class WellSkyTEDS:
         self.predict_errors()
         files = self.build_files() if(self.clients) else {}
         self.summary = self.predictor.summarize(self.issues, list(self.clients) + self.read_clients, files)
+        self.summary["filtered_out"] = dict(self.filtered_out)
         self.predictor.log_summary(self.summary)
         if(self.cli_dry_run):
             self.monitor.add_log(
@@ -1890,6 +2035,25 @@ class WellSkyTEDS:
                 ,log_line="--dry-run and --report-only cannot be used together: a dry run writes nothing, a report-only run writes the report."
             )
             valid = False
+
+        for flag, include, exclude in (("client", self.cli_include_client_ids, self.cli_exclude_client_ids), ("location", self.cli_include_location_ids, self.cli_exclude_location_ids)):
+            if(include is not None and exclude is not None):
+                self.monitor.add_log(
+                    log_system="WellSkyTEDS"
+                    ,log_category="Validate"
+                    ,log_subcategory="Settings Conflict"
+                    ,log_line=f"--include-{flag}-ids and --exclude-{flag}-ids cannot be used together: list the {flag}s to keep or the {flag}s to leave out, not both."
+                )
+                valid = False
+            for direction, ids in (("include", include), ("exclude", exclude)):
+                if(ids is not None and not ids):
+                    self.monitor.add_log(
+                        log_system="WellSkyTEDS"
+                        ,log_category="Validate"
+                        ,log_subcategory="Filter"
+                        ,log_line=f"--{direction}-{flag}-ids was given but names no IDs."
+                    )
+                    valid = False
 
         if(self.cli_path is None):
             self.monitor.add_log(
@@ -1952,12 +2116,19 @@ def main(get_args=False):
             Check and log counts only:
               wellsky-teds --path "C:/TEDS/Out" --dry-run
 
+            Check two clients only, leaving out one location:
+              wellsky-teds --path "C:/TEDS/Out" --include-client-ids "80000001,80000002" --exclude-location-ids "00923456"
+
             Without installing, run the file itself with the same flags:
               python WellSkyTEDS.py --path "C:/TEDS/Out"
 
             Rules
             -----
             - --path is required, and must be a folder holding .xml files.
+            - --include-client-ids and --exclude-client-ids cannot be used together;
+              nor can --include-location-ids and --exclude-location-ids. IDs match
+              exactly, without regard to case. A location is its license number,
+              leading zeros included.
             - To build XML, import WellSkyTEDS, Client, Episode and Substance in
               Python; see README.md.
         """),
@@ -1967,6 +2138,14 @@ def main(get_args=False):
     # Keep each add_argument(...) call on a single line when practical.
     core = parser.add_argument_group("Core Arguments")
     core.add_argument("--path", required=not get_args, type=Path, help="Folder of WellSky XML files to check; the report is written there.")
+
+    selection = parser.add_argument_group("Selection")
+    clients = selection.add_mutually_exclusive_group()
+    clients.add_argument("--include-client-ids", default=None, metavar="IDS", help="Client SourceIDs to check, comma-separated; every other client is left out.")
+    clients.add_argument("--exclude-client-ids", default=None, metavar="IDS", help="Client SourceIDs to leave out, comma-separated.")
+    locations = selection.add_mutually_exclusive_group()
+    locations.add_argument("--include-location-ids", default=None, metavar="IDS", help="Location license numbers (ProviderID) to check, comma-separated; episodes at every other location are left out.")
+    locations.add_argument("--exclude-location-ids", default=None, metavar="IDS", help="Location license numbers (ProviderID) whose episodes are left out, comma-separated.")
 
     behavior = parser.add_argument_group("Behavior")
     behavior.add_argument("--dry-run", action="store_true", default=False, help="Check everything, log counts, and write nothing.")
@@ -1982,6 +2161,10 @@ def main(get_args=False):
         path=args.path
         ,dry_run=args.dry_run
         ,report_only=args.report_only
+        ,include_client_ids=args.include_client_ids
+        ,exclude_client_ids=args.exclude_client_ids
+        ,include_location_ids=args.include_location_ids
+        ,exclude_location_ids=args.exclude_location_ids
     )
     if(not go.validate()):
         parser.print_help()

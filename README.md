@@ -535,6 +535,7 @@ These defaults follow the layout, or what working WellSky exports do. Pass a val
 {"clients": 2, "episodes": 2, "admissions": 2, "discharges": 1,
  "episodes_with_errors": 0, "errors": 0, "warnings": 0,
  "by_error": {...}, "by_element": {...},
+ "filtered_out": {"clients": 0, "episodes": 0},
  "files": ["KDADS_00987654_202609140815.xml", "KDADS_00934567_202609140815.xml"]}
 ```
 
@@ -553,12 +554,38 @@ These defaults follow the layout, or what working WellSky exports do. Pass a val
 | `exclude_errors` | `False` | When `True`, leaves out of the XML every episode with a predicted Error. By default everything is written, and the report says what is likely to be rejected. |
 | `dry_run` | `False` | Builds and checks everything, logs the counts, and writes nothing. |
 | `report_only` | `False` | Builds and checks everything and writes the predicted error report, but no XML. Can't be used with `dry_run`. |
+| `include_client_ids` | none | Client SourceIDs to keep; every other client is left out. See [Choosing clients and locations](#choosing-clients-and-locations). |
+| `exclude_client_ids` | none | Client SourceIDs to leave out. Can't be used with `include_client_ids`. |
+| `include_location_ids` | none | Location license numbers to keep; episodes at every other location are left out. |
+| `exclude_location_ids` | none | Location license numbers whose episodes are left out. Can't be used with `include_location_ids`. |
 | `now` | current time | The time used for `ReportingDate` and the file names. |
 | `monitor` | none | A hook for plugging in your own logger: any object with an `add_log(log_system, log_category, log_subcategory, log_line)` method. You can ignore it. |
 
 Every log line is printed. Log lines carry counts and file names only, never client information.
 
 You can also run the steps yourself: `teds.predict_errors()` returns the list of predicted problems, and `teds.build_files()` returns `{file name: XML text}` without writing anything.
+
+### Choosing clients and locations
+
+Four options pick which records a run covers, without changing the code that reads your data. They work the same in Python and on the [command line](#checking-an-existing-file).
+
+| Python option | Command-line flag | What it does |
+|---|---|---|
+| `include_client_ids` | `--include-client-ids` | Keeps only these clients, by client `SourceID`. |
+| `exclude_client_ids` | `--exclude-client-ids` | Leaves these clients out. |
+| `include_location_ids` | `--include-location-ids` | Keeps only episodes at these locations. |
+| `exclude_location_ids` | `--exclude-location-ids` | Leaves out episodes at these locations. |
+
+```python
+teds = WellSkyTEDS(path=r"C:\TEDS\Out", exclude_client_ids="80000001,80000002",
+                   include_location_ids=["00987654"])
+```
+
+- **A location is its license number**, the episode's `license`: the number that names the file and is sent as ProviderID. Records carry no location name, so there's no name filter. When checking existing files, the location is the `ProviderID` in the file.
+- **Lists** are comma-separated text, or a Python list. Each ID is trimmed. IDs match exactly, without regard to case, and with no wildcards. Leading zeros count: `987654` doesn't match `00987654`.
+- **Include and exclude for the same thing can't be used together.** On the command line, the flags refuse each other before anything runs; in Python, `validate()` fails and `execute()` writes nothing. A client filter and a location filter can be combined.
+- **Filters apply first.** What they leave out is in neither the XML nor the report, and isn't counted in the summary's totals. A client whose every episode is left out by a location filter is left out too.
+- **What's logged.** One line counts the clients and episodes left out. Another counts listed IDs that matched nothing, so a typo shows up, but never names a client ID. The summary `execute()` returns carries the same counts as `filtered_out`.
 
 ---
 
@@ -735,6 +762,7 @@ From the command line, it checks WellSky XML that already exists: an EHR's expor
 wellsky-teds --path "C:\TEDS\Out"
 wellsky-teds --path "C:\TEDS\Out" --dry-run
 wellsky-teds --path "C:\TEDS\Out" --report-only
+wellsky-teds --path "C:\TEDS\Out" --include-client-ids "80000001,80000002" --exclude-location-ids "00923456"
 ```
 
 If you copied the file instead of installing it, run `python WellSkyTEDS.py` with the same flags.
@@ -744,6 +772,12 @@ If you copied the file instead of installing it, run `python WellSkyTEDS.py` wit
 | `--path` | The folder of `.xml` files to check. The report is written there too. Required. |
 | `--dry-run` | Check and log counts; write nothing. |
 | `--report-only` | Check and write the predicted error report, but no XML. Can't be used with `--dry-run`. From the command line the files are only checked, so this writes the same report a plain run does. |
+| `--include-client-ids` | Check only these clients, by client SourceID, comma-separated. Can't be used with `--exclude-client-ids`. |
+| `--exclude-client-ids` | Leave these clients out of the check, comma-separated. |
+| `--include-location-ids` | Check only episodes at these locations, by license number (the file's `ProviderID`), comma-separated. Can't be used with `--exclude-location-ids`. |
+| `--exclude-location-ids` | Leave episodes at these locations out of the check, comma-separated. |
+
+The four filters work as described in [Choosing clients and locations](#choosing-clients-and-locations).
 
 Every log line is always printed. They hold counts and file names, never client information. To keep them, redirect the output: `wellsky-teds --path "C:\TEDS\Out" > check.log`.
 

@@ -196,6 +196,112 @@ def test_episode_without_license_is_left_out():
 
 
 # ----------------------------------------------------------------------
+# Include and exclude filters
+# ----------------------------------------------------------------------
+def add_three_clients(teds):
+    """Three made-up clients: two at location 00987654, and one with an episode at each of two locations."""
+    add_full_record(teds)
+    add_full_record(teds, client=client_values(source_id="90000002", first_name="Lee"))
+    add_full_record(teds, client=client_values(source_id="A0000003", first_name="Kai"))
+    third = teds.clients_by_id["A0000003"]
+    third.add_episode(Episode(**episode_values(license="00923456", admit_date="02012024"), rules=teds.rules)).add_substance(Substance(**substance_values()[0]))
+
+
+def client_ids_in(files):
+    """{file name: [client SourceIDs]} for built files."""
+    return {name: [c.find("SourceID").text for c in ET.fromstring(text.encode()).findall("Client")] for name, text in files.items()}
+
+
+def test_include_client_ids_keeps_only_those_clients():
+    teds = make_teds(include_client_ids=" 80000001, a0000003 ")
+    add_three_clients(teds)
+    assert client_ids_in(teds.build_files()) == {"KDADS_00987654_202609140815.xml": ["80000001", "A0000003"], "KDADS_00923456_202609140815.xml": ["A0000003"]}
+    assert teds.filtered_out == {"clients": 1, "episodes": 1}
+
+
+def test_exclude_client_ids_leaves_those_clients_out():
+    teds = make_teds(exclude_client_ids=["90000002", "A0000003"])
+    add_three_clients(teds)
+    assert client_ids_in(teds.build_files()) == {"KDADS_00987654_202609140815.xml": ["80000001"]}
+    assert [c.values["SourceID"] for c in teds.clients] == ["80000001"]
+
+
+def test_include_location_ids_keeps_only_those_episodes():
+    teds = make_teds(include_location_ids="00923456")
+    add_three_clients(teds)
+    assert client_ids_in(teds.build_files()) == {"KDADS_00923456_202609140815.xml": ["A0000003"]}
+    # Clients left with no episodes are left out, so the report has no lonely-client warning for them.
+    assert [c.values["SourceID"] for c in teds.clients] == ["A0000003"]
+    assert teds.filtered_out == {"clients": 2, "episodes": 3}
+    assert teds.predict_errors() == []
+
+
+def test_exclude_location_ids_leaves_those_episodes_out():
+    teds = make_teds(exclude_location_ids="00923456")
+    add_three_clients(teds)
+    assert client_ids_in(teds.build_files()) == {"KDADS_00987654_202609140815.xml": ["80000001", "90000002", "A0000003"]}
+    assert teds.filtered_out == {"clients": 0, "episodes": 1}
+
+
+def test_location_ids_match_the_license_exactly():
+    # Leading zeros are part of the license, so 987654 isn't 00987654.
+    teds = make_teds(include_location_ids="987654")
+    add_full_record(teds)
+    assert teds.build_files() == {}
+
+
+def test_client_and_location_filters_combine_and_apply_before_the_report(tmp_path):
+    teds = make_teds(tmp_path, include_client_ids="A0000003,90000002", exclude_location_ids="00987654")
+    add_three_clients(teds)
+    add_full_record(teds, client=client_values(source_id="90000004", county=""))
+    summary = teds.execute()
+    assert summary["files"] == ["KDADS_00923456_202609140815.xml"]
+    assert summary["clients"] == 1 and summary["episodes"] == 1
+    assert summary["filtered_out"] == {"clients": 3, "episodes": 4}
+    # The left-out client's blank county isn't in the report.
+    assert "CountyofResidence" not in (tmp_path / "wellsky_predicted_errors.csv").read_text(encoding="utf-8")
+
+
+def test_filters_apply_to_files_being_checked(tmp_path):
+    teds = make_teds(tmp_path)
+    add_three_clients(teds)
+    teds.execute()
+    checker = make_teds(tmp_path, dry_run=True, exclude_client_ids="80000001", include_location_ids="00987654")
+    summary = checker.execute()
+    assert summary["clients"] == 2 and summary["episodes"] == 2
+    assert sorted(c.values["SourceID"] for c in checker.read_clients) == ["90000002", "A0000003"]
+
+
+def test_filters_log_counts_and_unmatched_ids_but_no_ids():
+    monitor = ConsoleMonitor(verbose=False)
+    teds = WellSkyTEDS(path="unused", now=NOW, monitor=monitor, exclude_client_ids="90000002,99999999,99999998")
+    add_three_clients(teds)
+    teds.build_files()
+    teds.build_files()
+    lines = [line for line in monitor.lines if("Apply Filters" in line)]
+    assert lines == [
+        "WellSkyTEDS | Apply Filters | Left Out | 1 client(s) and 1 episode(s) left out by the include and exclude filters."
+        ,"WellSkyTEDS | Apply Filters | Warning | Listed IDs that matched nothing: 2 of --exclude-client-ids."
+    ]
+
+
+def test_include_and_exclude_together_fail_validation(tmp_path):
+    cases = (
+        (dict(include_client_ids="1", exclude_client_ids="2"), "--include-client-ids and --exclude-client-ids cannot be used together")
+        ,(dict(include_location_ids="1", exclude_location_ids="2"), "--include-location-ids and --exclude-location-ids cannot be used together")
+        ,(dict(include_client_ids=" , "), "--include-client-ids was given but names no IDs.")
+    )
+    for kwargs, message in cases:
+        teds = make_teds(tmp_path, **kwargs)
+        add_full_record(teds)
+        assert not teds.validate()
+        assert any(message in line for line in teds.monitor.lines)
+        assert teds.execute() is None
+    assert list(tmp_path.iterdir()) == []
+    assert make_teds(tmp_path).filters_active() is False
+
+
+# ----------------------------------------------------------------------
 # Adding the same thing twice
 # ----------------------------------------------------------------------
 def quiet():
@@ -717,3 +823,23 @@ def test_command_line_report_only(tmp_path, monkeypatch, capsys):
     main()
     assert "usage:" in capsys.readouterr().out
     assert not (tmp_path / "wellsky_predicted_errors.csv").exists()
+
+
+def test_command_line_filters(tmp_path, monkeypatch, capsys):
+    teds = make_teds(tmp_path)
+    add_three_clients(teds)
+    teds.execute()
+    (tmp_path / "wellsky_predicted_errors.csv").unlink()
+    monkeypatch.setattr(sys, "argv", ["WellSkyTEDS.py", "--path", str(tmp_path), "--include-client-ids", "80000001,A0000003", "--exclude-location-ids", "00923456"])
+    main()
+    out = capsys.readouterr().out
+    # Read back, each <Client> element is its own client: 90000002 by ID, and A0000003's 00923456 element by location.
+    assert "2 client(s) and 2 episode(s) left out by the include and exclude filters." in out
+    assert "2 client(s), 2 episode(s)" in out
+    args = main(get_args=True).parse_args(["--path", "x", "--include-location-ids", "00987654"])
+    assert (args.include_location_ids, args.exclude_location_ids, args.include_client_ids, args.exclude_client_ids) == ("00987654", None, None, None)
+    # Each include and exclude pair is mutually exclusive: argparse refuses the pair and exits.
+    for pair in (["--include-client-ids", "1", "--exclude-client-ids", "2"], ["--include-location-ids", "1", "--exclude-location-ids", "2"]):
+        with pytest.raises(SystemExit):
+            main(get_args=True).parse_args(["--path", "x"] + pair)
+        assert "not allowed with argument" in capsys.readouterr().err
